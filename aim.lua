@@ -25,6 +25,11 @@ if not LocalPlayer then
 	return
 end
 
+-- Touch-first devices (phones/tablets): no persistent mouse cursor, so all
+-- aim-point math switches to screen-center (crosshair) space and the aim
+-- trigger becomes an on-screen button instead of RMB.
+local TouchMode = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+
 local Camera = workspace.CurrentCamera
 
 --==============================================================================
@@ -45,7 +50,8 @@ local Settings = {
 }
 
 local Runtime = {
-	aimHeld = false,
+	aimHeldMouse = false,
+	aimHeldTouch = false,
 	windowVisible = true,
 	lockedTarget: Player? = nil,
 	lastStep = os.clock(),
@@ -65,6 +71,22 @@ local function cleanup()
 	table.clear(Connections)
 	RunService:UnbindFromRenderStep("AimAssistStep")
 	RunService:UnbindFromRenderStep("AimAssistFovDraw")
+end
+
+local function isAiming(): boolean
+	return Runtime.aimHeldMouse or Runtime.aimHeldTouch
+end
+
+-- Single source of truth for where the "crosshair" is:
+--   desktop .. system mouse position (viewport space, inset ignored)
+--   touch ... geometric screen center — matches how camera look works on
+--             mobile (drag-anywhere), and keeps the FOV ring stable under
+--             the finger that is steering the camera.
+local function getAimPoint(): Vector2
+	if TouchMode then
+		return Camera.ViewportSize / 2
+	end
+	return UserInputService:GetMouseLocation()
 end
 
 --==============================================================================
@@ -121,7 +143,7 @@ local function acquireTarget(): (Player?, BasePart?)
 		Runtime.lockedTarget = nil -- target died/despawned, fall through to reacquire
 	end
 
-	local mouse = UserInputService:GetMouseLocation()
+	local aimPoint = getAimPoint()
 	local bestPlayer: Player? = nil
 	local bestPart: BasePart? = nil
 	local bestScore = math.huge
@@ -144,7 +166,7 @@ local function acquireTarget(): (Player?, BasePart?)
 		end
 
 		local screenPos = Vector2.new(viewportPoint.X, viewportPoint.Y)
-		local distToCursor = (screenPos - mouse).Magnitude
+		local distToCursor = (screenPos - aimPoint).Magnitude
 
 		if not Settings.NoFov and distToCursor > Settings.FovRadius then
 			continue
@@ -177,7 +199,7 @@ local function onStep()
 	local dt = math.min(now - Runtime.lastStep, 0.05)
 	Runtime.lastStep = now
 
-	if not Settings.Enabled or not Runtime.aimHeld then
+	if not Settings.Enabled or not isAiming() then
 		if Settings.Mode == "Lock" then
 			Runtime.lockedTarget = nil -- release sticky lock when aim is not held
 		end
@@ -552,7 +574,7 @@ local statusLabel = baseInstance("TextLabel", {
 	TextSize = 12,
 	TextColor3 = Color3.fromRGB(140, 200, 140),
 	TextXAlignment = Enum.TextXAlignment.Left,
-	Text = "Idle — hold RMB to aim",
+	Text = TouchMode and "Idle — hold AIM button" or "Idle — hold RMB to aim",
 	Parent = content,
 }) :: TextLabel
 
@@ -595,7 +617,7 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		return
 	end
 	if input.UserInputType == Enum.UserInputType.MouseButton2 then
-		Runtime.aimHeld = true
+		Runtime.aimHeldMouse = true
 		Runtime.lastStep = os.clock()
 	elseif input.KeyCode == Enum.KeyCode.RightShift then
 		Runtime.windowVisible = not Runtime.windowVisible
@@ -605,10 +627,101 @@ end))
 
 track(UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton2 then
-		Runtime.aimHeld = false
+		Runtime.aimHeldMouse = false
 		Runtime.lockedTarget = nil
 	end
 end))
+
+-- Touch: an on-screen AIM button (bottom-right, thumb reach) drives the same
+-- aim state as RMB. TouchMode is decided once at startup; desktops never see
+-- the button, touch devices always do (MouseEnabled can flip on hybrid
+-- devices mid-session but the button remains a valid secondary trigger).
+local aimButton: TextButton? = nil
+if TouchMode then
+	aimButton = baseInstance("TextButton", {
+		Name = "AimButton",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -20, 1, -110),
+		Size = UDim2.fromOffset(88, 88),
+		BackgroundColor3 = Color3.fromRGB(28, 28, 32),
+		BackgroundTransparency = 0.35,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		TextColor3 = Color3.fromRGB(255, 255, 255),
+		Text = "AIM",
+		AutoButtonColor = false,
+		Parent = gui,
+	}) :: TextButton
+	baseInstance("UICorner", { CornerRadius = UDim.new(1, 0), Parent = aimButton })
+	baseInstance("UIStroke", {
+		Color = Color3.fromRGB(90, 200, 120),
+		Thickness = 2,
+		Transparency = 0.3,
+		Parent = aimButton,
+	})
+
+	-- Position is set in offset px; clamp inside viewport on small screens
+	-- (rotation/resolution changes re-evaluate it).
+	local function layoutAimButton()
+		local vp = Camera.ViewportSize
+		local side = math.clamp(math.floor(math.min(vp.X, vp.Y) * 0.18), 56, 96)
+		aimButton.Size = UDim2.fromOffset(side, side)
+		aimButton.Position = UDim2.new(1, -16, 1, -90 - math.floor(side * 0.2))
+	end
+	layoutAimButton()
+	track(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(layoutAimButton))
+
+	track(aimButton.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			Runtime.aimHeldTouch = true
+			aimButton.BackgroundColor3 = Color3.fromRGB(40, 80, 50)
+			Runtime.lastStep = os.clock()
+		end
+	end))
+	track(aimButton.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			Runtime.aimHeldTouch = false
+			aimButton.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+			Runtime.lockedTarget = nil
+		end
+	end))
+	-- Finger sliding off the button must still end the hold.
+	track(aimButton.TouchEnded:Connect(function()
+		Runtime.aimHeldTouch = false
+		aimButton.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+		Runtime.lockedTarget = nil
+	end))
+	-- Device losing touch capability mid-session: never leave the servo stuck on.
+	track(UserInputService:GetPropertyChangedSignal("TouchEnabled"):Connect(function()
+		if not UserInputService.TouchEnabled then
+			Runtime.aimHeldTouch = false
+			aimButton.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+			Runtime.lockedTarget = nil
+		end
+	end))
+	-- Window toggle button for touch users (no Right Shift on a phone).
+	local toggleButton = baseInstance("TextButton", {
+		Name = "SettingsToggle",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -20, 1, -20),
+		Size = UDim2.fromOffset(88, 40),
+		BackgroundColor3 = Color3.fromRGB(28, 28, 32),
+		BackgroundTransparency = 0.35,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		TextColor3 = Color3.fromRGB(255, 255, 255),
+		Text = "SETTINGS",
+		AutoButtonColor = false,
+		Parent = gui,
+	}) :: TextButton
+	baseInstance("UICorner", { CornerRadius = UDim.new(0, 8), Parent = toggleButton })
+	track(toggleButton.Activated:Connect(function()
+		Runtime.windowVisible = not Runtime.windowVisible
+		window.Visible = Runtime.windowVisible
+	end))
+end
 
 -- Window dragging (title bar grip).
 do
@@ -669,9 +782,10 @@ end))
 
 RunService:BindToRenderStep("AimAssistStep", Enum.RenderPriority.Camera.Value + 1, onStep)
 
--- FOV circle follows cursor; render after camera step so it never trails.
+-- FOV ring: centered on the live aim point (mouse on desktop, screen center
+-- on touch), rendered after the camera step so it never trails.
 RunService:BindToRenderStep("AimAssistFovDraw", Enum.RenderPriority.Camera.Value + 2, function()
-	local mouse = UserInputService:GetMouseLocation()
-	fovCircle.Position = UDim2.fromOffset(mouse.X, mouse.Y)
+	local aimPoint = getAimPoint()
+	fovCircle.Position = UDim2.fromOffset(aimPoint.X, aimPoint.Y)
 	fovCircle.Visible = Settings.Enabled and not Settings.NoFov
 end)
